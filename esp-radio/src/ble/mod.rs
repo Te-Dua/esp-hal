@@ -67,8 +67,18 @@ enum HciOutType {
     Command,
 }
 
+/// Largest outbound HCI packet this collector can reassemble.
+///
+/// 256 was too small for any host that negotiates a large ATT MTU: an ACL
+/// packet is 1 type byte + 4 ACL header bytes + payload, so a 256-byte ATT MTU
+/// alone reaches 265 with the L2CAP header, and an HCI command can reach 258
+/// (3 + 255). PebbleOS asks for a 256-byte MTU, so this overflowed in normal
+/// use and `push()` panicked in `copy_from_slice`, which takes the whole
+/// system down rather than dropping one packet.
+const HCI_OUT_BUF_LEN: usize = 512;
+
 struct HciOutCollector {
-    data: [u8; 256],
+    data: [u8; HCI_OUT_BUF_LEN],
     index: usize,
     ready: bool,
     kind: HciOutType,
@@ -77,7 +87,7 @@ struct HciOutCollector {
 impl HciOutCollector {
     fn new() -> HciOutCollector {
         HciOutCollector {
-            data: [0u8; 256],
+            data: [0u8; HCI_OUT_BUF_LEN],
             index: 0,
             ready: false,
             kind: HciOutType::Unknown,
@@ -89,6 +99,15 @@ impl HciOutCollector {
     }
 
     fn push(&mut self, data: &[u8]) {
+        // Bounds-check rather than let copy_from_slice panic. A panic in here
+        // is unrecoverable -- it brings down the radio and everything hosting
+        // it -- whereas dropping a packet the controller could never have been
+        // sent costs one HCI transaction. The host retries or resets.
+        if self.index + data.len() > self.data.len() {
+            self.reset();
+            return;
+        }
+
         self.data[self.index..(self.index + data.len())].copy_from_slice(data);
         self.index += data.len();
 
