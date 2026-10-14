@@ -1545,6 +1545,13 @@ pub fn send_hci(data: &[u8]) {
                         packet.len() as u16,
                         ACL_DATA_MBUF_LEADINGSPACE as u16,
                     );
+                    if om.is_null() {
+                        // Pool exhausted. Dropping one packet is recoverable
+                        // (the host's own timers retry); the panic below on a
+                        // null mbuf is not.
+                        warn!("no mbuf for an outbound ACL packet, dropping it");
+                        return;
+                    }
 
                     let res =
                         r_os_mbuf_append(om, packet.as_ptr().offset(1), (packet.len() - 1) as u16);
@@ -1552,9 +1559,19 @@ pub fn send_hci(data: &[u8]) {
                         panic!("r_os_mbuf_append returned {}", res);
                     }
 
-                    // this modification of the ACL data packet makes it getting sent and
-                    // received by the other side
-                    *((*om).om_data as *mut u8).offset(1) = 0;
+                    // Byte 1 of the ACL header holds the top of the connection
+                    // handle and the packet-boundary flags. LE uses 00 (first,
+                    // non-flushable) and 01 (continuing fragment); a host
+                    // written for BR/EDR sends 10 (first, flushable), which an
+                    // LE controller drops, so rewrite only that. Zeroing the
+                    // whole byte, as this used to, also turned every
+                    // continuation fragment into a start: any L2CAP PDU larger
+                    // than the controller's ACL buffer -- a full-MTU write --
+                    // reached the peer as two broken PDUs and was discarded.
+                    let flags = (*om).om_data.offset(1) as *mut u8;
+                    if (*flags & 0x30) == 0x20 {
+                        *flags &= !0x30;
+                    }
 
                     let res = r_ble_hci_trans_hs_acl_tx(om);
                     if res != 0 {
