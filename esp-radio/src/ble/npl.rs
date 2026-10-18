@@ -1485,22 +1485,36 @@ unsafe extern "C" fn ble_hs_hci_rx_evt(cmd: *const u8, arg: *const c_void) -> i3
 unsafe extern "C" fn ble_hs_rx_data(om: *const OsMbuf, arg: *const c_void) -> i32 {
     trace!("ble_hs_rx_data {:?} {:?}", om, arg);
 
-    let data_ptr = unsafe { (*om).om_data };
-    let len = unsafe { (*om).om_len };
-    let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, len as usize) };
+    // The controller may build one ACL packet from several chained mbufs when
+    // its large-block pool runs dry, so copy every segment, not just the first.
+    let mut data = [0u8; 256];
+    data[0] = 0x02; // ACL
+    let mut len = 1usize;
+    let mut seg = om;
+    let mut overflow = false;
+    while !seg.is_null() {
+        let seg_len = unsafe { (*seg).om_len } as usize;
+        if len + seg_len > data.len() {
+            overflow = true;
+            break;
+        }
+        let seg_data = unsafe { core::slice::from_raw_parts((*seg).om_data, seg_len) };
+        data[len..][..seg_len].copy_from_slice(seg_data);
+        len += seg_len;
+        seg = unsafe { (*seg).next };
+    }
 
-    super::BT_STATE.with(|state| {
-        let mut data = [0u8; 256];
+    if overflow {
+        error!("ble_hs_rx_data: ACL packet exceeds {} bytes, dropped", data.len() - 1);
+    } else {
+        super::BT_STATE.with(|state| {
+            state.rx_queue.push_back(ReceivedPacket {
+                data: Box::from(&data[..len]),
+            });
 
-        data[0] = 0x02; // ACL
-        data[1..][..data_slice.len()].copy_from_slice(data_slice);
-
-        state.rx_queue.push_back(ReceivedPacket {
-            data: Box::from(&data[..data_slice.len() + 1]),
+            super::dump_packet_info(&data[..len]);
         });
-
-        super::dump_packet_info(&data[..(len + 1) as usize]);
-    });
+    }
 
     unsafe {
         r_os_mbuf_free_chain(om as *mut _);
