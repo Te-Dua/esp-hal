@@ -73,6 +73,18 @@ impl<'d> BleConnector<'d> {
         Ok(read_next(buf))
     }
 
+    /// Read the next HCI packet, or register the context's waker to be woken
+    /// when one arrives. Unlike `read_async`, this never joins packets.
+    #[instability::unstable]
+    pub fn poll_next(&mut self, cx: &mut core::task::Context<'_>, buf: &mut [u8]) -> Poll<usize> {
+        // Register before checking, so a packet queued in between still wakes.
+        HCI_WAKER.register(cx.waker());
+        match read_next(buf) {
+            0 => Poll::Pending,
+            len => Poll::Ready(len),
+        }
+    }
+
     /// Read from HCI.
     #[instability::unstable]
     pub fn read(&mut self, mut buf: &mut [u8]) -> Result<usize, BleConnectorError> {
