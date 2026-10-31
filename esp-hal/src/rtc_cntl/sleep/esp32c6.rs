@@ -575,6 +575,9 @@ pub struct RtcSleepConfig {
     pub deep: bool,
     /// Power Down flags
     pub pd_flags: PowerDownFlags,
+    /// Keeps the main XTAL running through a light sleep, for a modem timer
+    /// clocked from it, such as the BLE controller's sleep timer.
+    pub keep_xtal: bool,
 }
 
 impl Default for RtcSleepConfig {
@@ -585,6 +588,7 @@ impl Default for RtcSleepConfig {
         Self {
             deep: false,
             pd_flags: PowerDownFlags(0),
+            keep_xtal: false,
         }
     }
 }
@@ -732,7 +736,7 @@ impl RtcSleepConfig {
             // regulator to the 0.6 V light-sleep voltage instead of holding it at the
             // active calibration voltage (see `AnalogSleepConfig::defaults_light_sleep`),
             // which is the dominant saving.
-            self.pd_flags.set_pd_xtal(true);
+            self.pd_flags.set_pd_xtal(!self.keep_xtal);
             self.pd_flags.set_pd_rc_fast(true);
             self.pd_flags.set_pd_xtal32k(!lp_slow_uses_xtal32k);
         }
