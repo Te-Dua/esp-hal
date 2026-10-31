@@ -529,6 +529,10 @@ pub(crate) struct npl_funcs_t {
     p_ble_npl_hw_exit_critical: Option<unsafe extern "C" fn(mask: u32)>,
     p_ble_npl_get_time_forever: Option<unsafe extern "C" fn() -> u32>,
     p_ble_npl_hw_is_in_critical: Option<unsafe extern "C" fn() -> u8>,
+    // Read by the ESP32-C6 controller's sleep timer, which posts its wakeup
+    // event ahead of the rest; a missing slot jumps to whatever follows.
+    p_ble_npl_eventq_put_to_front:
+        Option<unsafe extern "C" fn(queue: *mut ble_npl_eventq, event: *const ble_npl_event)>,
 }
 
 static mut G_NPL_FUNCS: npl_funcs_t = npl_funcs_t {
@@ -576,6 +580,7 @@ static mut G_NPL_FUNCS: npl_funcs_t = npl_funcs_t {
     p_ble_npl_hw_exit_critical: Some(ble_npl_hw_exit_critical),
     p_ble_npl_get_time_forever: Some(ble_npl_get_time_forever),
     p_ble_npl_hw_is_in_critical: Some(ble_npl_hw_is_in_critical),
+    p_ble_npl_eventq_put_to_front: Some(ble_npl_eventq_put_to_front),
 };
 
 #[repr(C)]
@@ -959,6 +964,32 @@ unsafe extern "C" fn ble_npl_eventq_put(queue: *mut ble_npl_eventq, event: *cons
 
     // Store the pointer to the ble_npl_event in the queue - this is what we'll need to dequeue.
     queue::queue_send_to_back(
+        wrapper.dummy as _,
+        (&raw const event).cast(),
+        OSI_FUNCS_TIME_BLOCKING,
+    );
+}
+
+unsafe extern "C" fn ble_npl_eventq_put_to_front(
+    queue: *mut ble_npl_eventq,
+    event: *const ble_npl_event,
+) {
+    trace!("ble_npl_eventq_put_to_front {:?} {:?}", queue, event);
+
+    let evt = unsafe { (*event).dummy } as *mut Event;
+    assert!(!evt.is_null());
+
+    if unsafe { (*evt).queued } {
+        return;
+    }
+
+    unsafe {
+        (*evt).queued = true;
+    }
+
+    let wrapper = unwrap!(unsafe { queue.as_mut() }, "queue wrapper is null");
+
+    queue::queue_send_to_front(
         wrapper.dummy as _,
         (&raw const event).cast(),
         OSI_FUNCS_TIME_BLOCKING,
