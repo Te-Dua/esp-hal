@@ -276,7 +276,7 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
         ble_ll_rsp_dup_list_count: config.ll_rsp_dup_list_count,
         ble_ll_adv_dup_list_count: config.ll_adv_dup_list_count,
         ble_ll_tx_pwr_dbm: config.default_tx_power.dbm() as u8,
-        rtc_freq: 32000,
+        rtc_freq: BLE_LPCLK_HZ as _,
         ble_ll_sca: 60,
         ble_ll_scan_phy_number: 2,
         ble_ll_conn_def_auth_pyld_tmo: 3000,
@@ -301,7 +301,7 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
         enable_bqb_test: config.bqb_test as u8,
         enable_tx_cca: config.cca as u8,
         cca_rssi_thresh: (256 - config.cca_threshold as u32) as u8,
-        sleep_en: 0,
+        sleep_en: 1,
         coex_phy_coded_tx_rx_time_limit: 0,
         dis_scan_backoff: config.dis_scan_backoff as u8,
         ble_scan_classify_filter_enable: 1,
@@ -372,8 +372,120 @@ pub(super) unsafe extern "C" fn esp_intr_alloc(
     0
 }
 
+/// The BLE sleep timer runs at this rate, from the main XTAL (ESP-IDF's
+/// default, `s_bt_lpclk_freq`).
+const BLE_LPCLK_HZ: u32 = 100_000;
+
+const MODEM_LPCON_LP_TIMER_CONF: *mut u32 = 0x600A_F004 as *mut u32;
+const MODEM_LPCON_CLK_CONF: *mut u32 = 0x600A_F018 as *mut u32;
+const MODEM_LPCON_CLK_CONF_POWER_ST: *mut u32 = 0x600A_F020 as *mut u32;
+const PMU_HP_SLEEP_ICG_HP_FUNC: *mut u32 = 0x600B_006C as *mut u32;
+
 pub(super) fn ble_rtc_clk_init() {
     crate::radio_clocks::clocks_ll::ble_rtc_clk_init();
+    ble_sleep_clock_apply();
+}
+
+/// Selects and ungates the BLE sleep timer's clock. These registers sit in
+/// the modem domain, so call this again after a sleep that powered it down.
+#[crate::hal::ram]
+pub fn ble_sleep_clock_apply() {
+    // Like ESP-IDF's esp_bt_rtc_slow_clk_select(MAIN_XTAL). From ECO1 on the
+    // timer's XTAL input is really the Wi-Fi power clock at 500 kHz, which
+    // has to stay ungated in sleep for the timer to keep counting.
+    let eco0 = esp_hal::efuse::major_chip_version() == 0 && esp_hal::efuse::minor_chip_version() == 0;
+    let src_hz = if eco0 { 40_000_000 } else { 500_000 };
+    let div = src_hz / BLE_LPCLK_HZ - 1;
+    unsafe {
+        // sel_xtal, divider
+        MODEM_LPCON_LP_TIMER_CONF.write_volatile((1 << 2) | (div << 4));
+        // clk_lp_timer_en
+        MODEM_LPCON_CLK_CONF.write_volatile(MODEM_LPCON_CLK_CONF.read_volatile() | (1 << 3));
+        if !eco0 {
+            // clk_wifipwr_en; ungated in the PMU's sleep ICG code (bit 0 of
+            // the wifipwr map); and PMU_ICG_FUNC_ENA_RETENTION, which IDF
+            // remaps to this clock, set in the HP sleep state.
+            MODEM_LPCON_CLK_CONF.write_volatile(MODEM_LPCON_CLK_CONF.read_volatile() | (1 << 0));
+            MODEM_LPCON_CLK_CONF_POWER_ST
+                .write_volatile(MODEM_LPCON_CLK_CONF_POWER_ST.read_volatile() | (1 << 16));
+            PMU_HP_SLEEP_ICG_HP_FUNC.write_volatile(PMU_HP_SLEEP_ICG_HP_FUNC.read_volatile() | (1 << 9));
+        }
+    }
+}
+
+/// Microseconds the controller wants between its sleep callback and the
+/// next radio event before it sleeps, for a light sleep (ESP-IDF's
+/// BLE_RTC_DELAY_US_LIGHT_SLEEP).
+const BLE_RTC_DELAY_US_LIGHT_SLEEP: u32 = 3200;
+
+/// False while the controller has nothing to do until its sleep timer fires,
+/// so the chip may light-sleep with Bluetooth on.
+static BLE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Whether the controller is asleep until its next radio event.
+pub fn controller_asleep() -> bool {
+    !BLE_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+unsafe extern "C" {
+    fn r_ble_lll_sleep_set_sleep_cb(
+        s_cb: *const c_void,
+        w_cb: *const c_void,
+        s_arg: *mut c_void,
+        w_arg: *mut c_void,
+        us_to_enabled: u32,
+    );
+    fn r_ble_rtc_wake_up_state_clr();
+    fn r_esp_ble_set_wakeup_overhead(overhead: u32);
+}
+
+/// PMU wakeup-cause bit of the BLE sleep timer (PMU_BLE_SOC_WAKEUP_EN).
+const PMU_WAKEUP_BT: u32 = 1 << 10;
+const PMU_SLP_WAKEUP_STATUS0: *const u32 = 0x600B_0140 as *const u32;
+
+#[crate::hal::ram]
+unsafe extern "C" fn controller_sleep_cb(_enable_tick: u32, _arg: *mut c_void) {
+    if !BLE_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    unsafe { r_ble_rtc_wake_up_state_clr() };
+    esp_phy::disable_phy();
+    BLE_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+}
+
+#[crate::hal::ram]
+unsafe extern "C" fn controller_wakeup_cb(arg: *mut c_void) {
+    if BLE_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    unsafe { r_ble_rtc_wake_up_state_clr() };
+    core::mem::forget(esp_phy::enable_phy());
+    // bt_wakeup_params_t: rtc_freq:20, rsv:11, bt_wakeup:1
+    if !arg.is_null() {
+        let params = arg as *mut u32;
+        let by_bt = unsafe { PMU_SLP_WAKEUP_STATUS0.read_volatile() } & PMU_WAKEUP_BT != 0;
+        unsafe { params.write_volatile((params.read_volatile() & !(1 << 31)) | ((by_bt as u32) << 31)) };
+    }
+    BLE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Like ESP-IDF's controller_sleep_init() for tickless light sleep, minus
+/// the MAC retention: PebbleOS keeps the modem domain powered while the
+/// controller sleeps.
+pub(super) fn controller_sleep_init() {
+    unsafe {
+        r_ble_lll_sleep_set_sleep_cb(
+            controller_sleep_cb as *const c_void,
+            controller_wakeup_cb as *const c_void,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            BLE_RTC_DELAY_US_LIGHT_SLEEP,
+        );
+        // Time from the wake to running code, which the controller adds
+        // ahead of each radio event. Measured as ~2.4 ms awake per wake,
+        // of which most is our own work; start generous.
+        r_esp_ble_set_wakeup_overhead(1500);
+    }
 }
 
 pub(super) unsafe extern "C" fn reset_modem(_mdl_opts: u8, _start: u8) {

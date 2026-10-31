@@ -1309,6 +1309,9 @@ pub(crate) fn ble_init(config: &Config) -> PhyInitGuard<'static> {
             core::ptr::null(),
         );
 
+        #[cfg(esp32c6)]
+        ble_os_adapter_chip_specific::controller_sleep_init();
+
         #[cfg(esp32c2)]
         let res = ble_controller_enable(1); // 1 = BLE
         #[cfg(not(esp32c2))]
